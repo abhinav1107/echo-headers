@@ -3,56 +3,126 @@ name: ci
 on:
   workflow_dispatch:
   pull_request:
-    branches:
-      - main
-    types:
-      - closed
+    branches: [main]
+    types: [opened, synchronize, reopened]
     paths:
       - '.github/workflows/ci.yml'
       - 'Dockerfile'
       - 'VERSION'
       - 'go.mod'
-      - 'main.go'
-      - 'main_test.go'
-      - 'charts/echo-headers/**'
+      - 'go.sum'
+      - '**/*.go'
+      - 'charts/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'Dockerfile'
+      - 'VERSION'
+      - 'go.mod'
+      - 'go.sum'
+      - '**/*.go'
+      - 'charts/**'
+
+# Avoid overlapping release runs on rapid successive merges
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  binaries:
-    name: Build and Publish Binaries
+  test:
+    name: Go tests
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
-
-    outputs:
-      app_version: ${{ steps.get_version.outputs.version }}
 
     steps:
-      - name: Check out code
+      - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Get App Version
-        id: get_version
-        run: |
-          VERSION=$(cat VERSION)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
 
-      - name: Run Tests
-        run: go test -v ./...
+      - name: Tidy + Test
+        run: |
+          set -euo pipefail
+          go mod tidy
+          go test -v ./...
+
+  # Determine which areas changed so we can skip work on pushes.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    needs: [test]
+    outputs:
+      app: ${{ steps.filter.outputs.app }}
+      charts: ${{ steps.filter.outputs.charts }}
+      docker: ${{ steps.filter.outputs.docker }}
+    # Only compute change sets for release contexts (push to main / manual)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout (full history for accurate diffs)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            app:
+              - 'VERSION'
+              - 'go.mod'
+              - 'go.sum'
+              - '**/*.go'
+            docker:
+              - 'Dockerfile'
+              - 'VERSION'
+              - 'go.mod'
+              - 'go.sum'
+              - '**/*.go'
+            charts:
+              - 'charts/**'
+
+  binaries:
+    name: Build and publish binaries (GitHub Release)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    permissions:
+      contents: write
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.app == 'true'
+
+    outputs:
+      app_version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get App Version
+        id: get_version
+        run: |
+          set -euo pipefail
+          VERSION=$(cat VERSION)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Build multi-platform binaries
         run: |
-          set -e
-
-          go mod tidy
+          set -euo pipefail
 
           mkdir -p dist
           OS_ARCHES=("linux:amd64" "linux:arm64" "darwin:amd64" "darwin:arm64")
@@ -61,10 +131,10 @@ jobs:
             IFS=":" read -r GOOS GOARCH <<< "$osarch"
             FILE_NAME="dist/echo-headers-${GOOS}-${GOARCH}"
             echo "Building binary for ${GOOS}/${GOARCH}..."
-            GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=0 go build -o ${FILE_NAME} .
+            GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "${FILE_NAME}" .
           done
 
-      - name: Auto populate release notes
+      - name: Auto populate release notes (draft)
         if: github.event_name != 'workflow_dispatch'
         uses: release-drafter/release-drafter@v6
         id: release_drafter
@@ -75,7 +145,7 @@ jobs:
           version: ${{ steps.get_version.outputs.version }}
           publish: false
 
-      - name: Create Github release
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -83,7 +153,7 @@ jobs:
           files: dist/echo-headers-*
           tag_name: v${{ steps.get_version.outputs.version }}
           name: v${{ steps.get_version.outputs.version }}
-          body: ${{ steps.release_drafter.outputs.body || format('Release v{0}', steps.get_version.outputs.version)}}
+          body: ${{ steps.release_drafter.outputs.body || format('Release v{0}', steps.get_version.outputs.version) }}
 
       - name: Update CHANGELOG
         if: github.event_name != 'workflow_dispatch'
@@ -92,40 +162,31 @@ jobs:
           latest-version: v${{ steps.get_version.outputs.version }}
           release-notes: ${{ steps.release_drafter.outputs.body }}
 
-      - name: Commit Updated CHANGELOG
+      - name: Commit updated CHANGELOG
         if: github.event_name != 'workflow_dispatch'
-        uses: stefanzweifel/git-auto-commit-action@v7
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          branch: ${{ github.event.pull_request.base.ref }}
+          branch: ${{ github.ref_name }}
           commit_message: Update CHANGELOG for release v${{ steps.get_version.outputs.version }}
           file_pattern: CHANGELOG.md
 
-      - name: Delete Draft Release
+      - name: Delete draft release
         if: github.event_name != 'workflow_dispatch'
         uses: hugo19941994/delete-draft-releases@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   docker:
-    needs: binaries
-    name: Build and Publish Docker Image
+    name: Build and publish Docker image (GHCR)
     runs-on: ubuntu-latest
+    needs: [binaries, changes]
     permissions:
       contents: read
       packages: write
-      attestations: write
-      id-token: write
-
-    env:
-      CONTAINER_REGISTRY: ghcr.io
-      IMAGE_NAME: ${{ github.repository }}
-
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.docker == 'true'
 
     steps:
-      - name: checkout
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup QEMU
@@ -134,43 +195,43 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.CONTAINER_REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Metadata for Container Image
+      - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository_owner }}/echo-headers
+          tags: |
+            type=raw,value=v${{ needs.binaries.outputs.app_version }}
+            type=raw,value=latest
 
-      - name: Build and push Container image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ needs.binaries.outputs.app_version }}
-            ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   charts:
-    needs: [binaries, docker]
-    name: Publish Helm Chart
+    name: Publish Helm chart to GitHub Pages (gh-pages)
     runs-on: ubuntu-latest
+    needs: [changes]
     permissions:
       contents: write
-
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.charts == 'true'
 
     steps:
-      - name: Checkout code
+      - name: Checkout (full history)
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -180,7 +241,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Release Helm Chart
+      - name: Release Helm chart
         uses: helm/chart-releaser-action@v1.7.0
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
