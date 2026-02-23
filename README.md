@@ -1,4 +1,75 @@
-# echo-headers Helm Chart Repository
+# echo-headers
+
+A very simple webserver in Golang that prints all headers reaching it.
+
+The code is mostly copy+paste from these repositories:
+- [hashicorp/http-echo](https://github.com/hashicorp/http-echo)
+- [bukowa/http-headers](https://github.com/bukowa/http-headers)
+
+## Run
+
+### Using Docker
+The simplest way to run would be to use docker.
+
+#### Docker Build
+To build docker container image, from the root of this project, simply run:
+```shell
+docker build -t local/echo-headers .
+```
+
+#### Docker Run
+Once the docker container image is build, simply run:
+```shell
+docker run --name echo-headers -p 8080:8080 local/echo-headers:latest
+```
+
+### Directly from command line
+To run this webserver, pre-requisite is to have go `1.23+` installed. Once that's met, from root of the project, simply run:
+
+```shell
+go run main.go
+```
+
+To build this webserver, run
+```shell
+go build .
+```
+
+This will generate `echo-headers` binary in current directory. Then to run the webserver, run:
+```shell
+./echo-headers
+```
+
+To check help, run:
+```shell
+$ ./echo-headers --help
+Usage of ./echo-headers:
+  -host string
+        interface to listen on (default "0.0.0.0")
+  -port string
+        port to listen on (default "8080")
+```
+
+## Check Run
+If the run is successful, the output should look something like this:
+```text
+2024/10/10 12:02:17 [INFO] server is listening on 0.0.0.0:8080
+
+```
+
+## Test
+To test, run this from command line:
+
+```shell
+curl -H "Custom-Header: SomeValue" http://localhost:8080/
+```
+
+the output should look like this:
+```text
+{"Accept":"*/*","Custom-Header":"SomeValue","User-Agent":"curl/8.7.1"}
+```
+
+## Helm Chart
 
 This GitHub Pages site hosts the Helm chart repository for **echo-headers**.
 
@@ -6,7 +77,7 @@ It is published from the `gh-pages` branch of this repo and should contain:
 - `index.yaml` (Helm repository index)
 - packaged charts (`*.tgz`)
 
-## Add the Helm repository
+### Add Helm Repository
 ```bash
 helm repo add echo-headers https://abhinav1107.github.io/echo-headers/
 helm repo update
@@ -19,8 +90,7 @@ helm search repo echo-headers
 helm search repo echo-headers/echo-headers
 ```
 
-## Install the chart
-
+### Install chart
 Create a namespace (optional, recommended):
 ```bash
 kubectl create namespace echo-headers --dry-run=client -o yaml | kubectl apply -f -
@@ -30,13 +100,12 @@ install:
 ```bash
 helm upgrade --install echo-headers echo-headers/echo-headers --namespace echo-headers
 ```
-
 Uninstall:
 ```bash
 helm uninstall echo-headers --namespace echo-headers
 ```
 
-## Using custom values
+### Using custom values
 Export the default values:
 ```bash
 helm show values echo-headers/echo-headers > values.yaml
@@ -46,3 +115,4 @@ Edit values.yaml, then install/upgrade with it:
 ```bash
 helm upgrade --install echo-headers echo-headers/echo-headers --namespace echo-headers -f values.yaml
 ```
+
