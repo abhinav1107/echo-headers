@@ -1,0 +1,191 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'Dockerfile'
+      - 'VERSION'
+      - 'go.mod'
+      - 'main.go'
+      - 'main_test.go'
+      - 'charts/echo-headers/**'
+
+jobs:
+  binaries:
+    name: Build and Publish Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+
+    outputs:
+      app_version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Get App Version
+        id: get_version
+        run: |
+          VERSION=$(cat VERSION)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Tests
+        run: go test -v ./...
+
+      - name: Build multi-platform binaries
+        run: |
+          set -e
+
+          go mod tidy
+
+          mkdir -p dist
+          OS_ARCHES=("linux:amd64" "linux:arm64" "darwin:amd64" "darwin:arm64")
+
+          for osarch in "${OS_ARCHES[@]}"; do
+            IFS=":" read -r GOOS GOARCH <<< "$osarch"
+            FILE_NAME="dist/echo-headers-${GOOS}-${GOARCH}"
+            echo "Building binary for ${GOOS}/${GOARCH}..."
+            GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=0 go build -o ${FILE_NAME} .
+          done
+
+      - name: Auto populate release notes
+        if: github.event_name != 'workflow_dispatch'
+        uses: release-drafter/release-drafter@v6
+        id: release_drafter
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: v${{ steps.get_version.outputs.version }}
+          version: ${{ steps.get_version.outputs.version }}
+          publish: false
+
+      - name: Create Github release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: dist/echo-headers-*
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: v${{ steps.get_version.outputs.version }}
+          body: ${{ steps.release_drafter.outputs.body || format('Release v{0}', steps.get_version.outputs.version)}}
+
+      - name: Update CHANGELOG
+        if: github.event_name != 'workflow_dispatch'
+        uses: stefanzweifel/changelog-updater-action@v1
+        with:
+          latest-version: v${{ steps.get_version.outputs.version }}
+          release-notes: ${{ steps.release_drafter.outputs.body }}
+
+      - name: Commit Updated CHANGELOG
+        if: github.event_name != 'workflow_dispatch'
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          branch: ${{ github.event.pull_request.base.ref }}
+          commit_message: Update CHANGELOG for release v${{ steps.get_version.outputs.version }}
+          file_pattern: CHANGELOG.md
+
+      - name: Delete Draft Release
+        if: github.event_name != 'workflow_dispatch'
+        uses: hugo19941994/delete-draft-releases@v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    needs: binaries
+    name: Build and Publish Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    env:
+      CONTAINER_REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.CONTAINER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Metadata for Container Image
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ needs.binaries.outputs.app_version }}
+            ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+
+  charts:
+    needs: [binaries, docker]
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git client
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Release Helm Chart
+        uses: helm/chart-releaser-action@v1.7.0
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        with:
+          charts_dir: charts
+          pages_branch: gh-pages
+          packages_with_index: true
+          skip_existing: true
