@@ -5,3 +5,8 @@
 - This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- New Release notes will be placed here automatically -->
+## v1.0.0 - 2026-02-23
+
+### Changes
+
+- bumped chart version to trigger built @abhinav1107 (#1)
